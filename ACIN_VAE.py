@@ -1,5 +1,6 @@
 import numpy as np
 import tensorflow as tf
+import h5py
 from sampling_utils import *
 from tensorflow.examples.tutorials.mnist import input_data
 try:
@@ -10,7 +11,7 @@ except ImportError:
 # command line arguments
 flags = tf.flags
 flags.DEFINE_integer("batchSize", 128, "batch size.")
-flags.DEFINE_integer("nEpochs", 5, "number of epochs to train.")
+flags.DEFINE_integer("nEpochs", 2, "number of epochs to train.")
 flags.DEFINE_float("adamLr", 1e-4, "AdaM learning rate.")
 flags.DEFINE_integer("hidden_size", 200, "number of hidden units in en/decoder.")
 flags.DEFINE_integer("latent_size", 50, "dimensionality of latent variables.")
@@ -54,6 +55,10 @@ class ACIN_VAE(object):
         self.x_recons_linear = self.f_prop(hyperParams)
 
         self.elbo_obj = self.get_ELBO()
+
+        self.final_pis = tf.concat([tf.expand_dims(t, 2) for t in self.pis], 2)
+        self.final_mus = tf.concat([tf.expand_dims(t, 2) for t in self.mus], 2)
+        self.final_sigmas = tf.concat([tf.expand_dims(t, 2) for t in self.sigmas], 2)
 
     def init_encoder(self, hyperParams):
         return {'h': {'W': tf.Variable(tf.random_normal([hyperParams['input_d'], hyperParams['rnn_hidden_d']], stddev=.00001)),
@@ -147,15 +152,38 @@ class ACIN_VAE(object):
         for k in range(self.K):
             ent_mix_weights += -self.pis[k] * tf.log(self.pis[k] + .001)
 
+        #Expectation of Prior  \sum_k \pi_k E(q_k)[log(p(z))]
+        expectation_prior = 0.
+        for k in range(self.K):
+            expectation_prior += -self.pis[k] * (self.sigmas[k] ** 2 + self.mus[k] ** 2 + 0.79817986835) #log(2pie)
+
         # final objective
         elbo = tf.reduce_mean(nll + ent_lb_term - self.regularization_weight * ent_mix_weights)
 
         return elbo
 
+    def get_log_margLL(self):
+
+        nll = 0
+        for k in range(self.K):
+            nll -= self.pis[k] * compute_nll(self.X, self.x_recons_linear[k])
+
+        # calc prior prior':{'mu':0., 'sigma':1.}
+        log_prior = 0
+        for k in range(self.K):
+            log_prior += self.pis[k] * log_normal_pdf(self.z[k], 0., 1.)
+
+        # calc post
+        log_post = 0
+        for k in range(self.K):
+            log_post += self.pis[k] * log_normal_pdf(self.z[k], self.mus[k], self.sigmas[k])
+
+        return nll + log_prior - log_post
+
     def get_samples(self, nImages):
         samples_from_each_component = []
         for k in xrange(self.K):
-            z = self.mus[k] + tf.multiply(self.sigmas[k],tf.random_normal((nImages, tf.shape(self.decoder_params['w'][0])[0])))
+            z = 0. + tf.multiply(1.,tf.random_normal((nImages, tf.shape(self.decoder_params['w'][0])[0])))
             samples_from_each_component.append(tf.sigmoid(mlp(z, self.decoder_params)))
         return samples_from_each_component
 
@@ -163,8 +191,8 @@ class ACIN_VAE(object):
 
 
 def trainVAE(data, vae_hyperParams, hyperParams):
-    N_train, d = data.train.images.shape
-    N_valid, d = data.validation.images.shape
+    N_train, d = data['train'].shape
+    N_valid, d = data['valid'].shape
     nTrainBatches = N_train / hyperParams['batchSize']
     nValidBatches = N_valid / hyperParams['batchSize']
     vae_hyperParams['batchSize'] = hyperParams['batchSize']
@@ -192,14 +220,14 @@ def trainVAE(data, vae_hyperParams, hyperParams):
             # training
             train_elbo = 0.
             for batch_idx in xrange(nTrainBatches):
-                x = data.train.images[batch_idx * hyperParams['batchSize']:(batch_idx + 1) * hyperParams['batchSize'],:]
+                x = data['train'][batch_idx * hyperParams['batchSize']:(batch_idx + 1) * hyperParams['batchSize'],:]
                 _, elbo_train = s.run([optimizer, model.elbo_obj], {model.X: x, model.regularization_weight: w})
                 train_elbo += elbo_train
 
             # validation
             valid_elbo = 0.
             for batch_idx in xrange(nValidBatches):
-                x = data.validation.images[batch_idx * hyperParams['batchSize']:(batch_idx + 1) * hyperParams['batchSize'], :]
+                x = data['valid'][batch_idx * hyperParams['batchSize']:(batch_idx + 1) * hyperParams['batchSize'], :]
                 valid_elbo += s.run(model.elbo_obj, {model.X: x,model.regularization_weight: w})
 
             # check for ELBO improvement
@@ -211,14 +239,77 @@ def trainVAE(data, vae_hyperParams, hyperParams):
             logging_str = "Epoch %d.  Train ELBO: %.3f,  Validation ELBO: %.3f %s" % (epoch_idx + 1, train_elbo, valid_elbo, star_printer)
             print logging_str
 
+        x = data['train'][0:hyperParams['batchSize'], :]
+        mu, si, pi = s.run([model.final_mus, model.final_sigmas, model.final_pis],feed_dict={model.X: x})
+        mu, si, pi = mu[0, :, :], si[0, :, :], pi[0, :, :]
+        print "Mu: " + str(mu)
+        print "Sigma: " + str(si)
+        print "Pis: " + str(pi)
 
+        # evaluate marginal likelihood
+        print "Calculating the marginal likelihood..."
+        N, d = mnist['test'].shape
+        sample_collector = []
+        nSamples = 50
+        for s_idx in xrange(nSamples):
+            samples = s.run(model.get_log_margLL(), {model.X: mnist['test']})
+            if not np.isnan(samples.mean()) and not np.isinf(samples.mean()):
+                sample_collector.append(samples)
+
+        if len(sample_collector) < 1:
+            print "\tMARG LIKELIHOOD CALC: No valid samples were collected!"
+            return np.nan
+
+        all_samples = np.hstack(sample_collector)
+        m = np.amax(all_samples, axis=1)
+        mLL = m + np.log(np.mean(np.exp(all_samples - m[np.newaxis].T), axis=1))
+
+        logging_str = "\nTest Marginal Likelihood: %.3f" % (mLL.mean())
+        print logging_str
+
+        nImages = 10
+        sample_list = s.run(model.get_samples(nImages))
+        for i, samples in enumerate(sample_list):
+            image = Image.fromarray(tile_raster_images(X=samples, img_shape=(28, 28),
+                                                       tile_shape=(int(np.sqrt(nImages)), int(np.sqrt(nImages))),
+                                                       tile_spacing=(1, 1)))
+            image.save("./" + "_component" + str(i) + ".png")
+
+def calc_margLikelihood(data, model, vae_hyperParams, nSamples=50):
+    N, d = data.shape
+
+    # get op to load the model
+    persister = tf.train.Saver()
+
+    with tf.Session() as s:
+        # persister.restore(s, param_file_path)
+
+        sample_collector = []
+        for s_idx in xrange(nSamples):
+            samples = s.run(model.get_log_margLL(N), {model.X: data})
+            if not np.isnan(samples.mean()) and not np.isinf(samples.mean()):
+                sample_collector.append(samples)
+
+    if len(sample_collector) < 1:
+        print "\tMARG LIKELIHOOD CALC: No valid samples were collected!"
+        return np.nan
+
+    all_samples = np.hstack(sample_collector)
+    m = np.amax(all_samples, axis=1)
+    mLL = m + np.log(np.mean(np.exp(all_samples - m[np.newaxis].T), axis=1))
+    return mLL.mean()
 
 if __name__ == "__main__":
-    mnist = input_data.read_data_sets("MNIST_data/", one_hot=True)
+    #mnist = input_data.read_data_sets("MNIST_data/", one_hot=True)
+
+    # load MNIST
+    f = h5py.File('./binarized_mnist.h5')
+    mnist = {'train': np.copy(f['train']), 'valid': np.copy(f['valid']), 'test': np.copy(f['test'])}
+    np.random.shuffle(mnist['train'][0])
 
     # set architecture params
 
-    vae_hyperParams = {'input_d': mnist.train.images.shape[1], 'rnn_hidden_d': inArgs.hidden_size,'hidden_d': inArgs.hidden_size,
+    vae_hyperParams = {'input_d':mnist['train'].shape[1], 'rnn_hidden_d': inArgs.hidden_size,'hidden_d': inArgs.hidden_size,
                        'z_space_d': inArgs.latent_size, 'K': inArgs.K}
 
     # set training hyperparameters
@@ -226,4 +317,5 @@ if __name__ == "__main__":
 
     # train
     print "Training model..."
+
     trainVAE(mnist, vae_hyperParams, train_hyperParams)
