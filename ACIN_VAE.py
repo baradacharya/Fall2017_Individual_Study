@@ -155,10 +155,10 @@ class ACIN_VAE(object):
         #Expectation of Prior  \sum_k \pi_k E(q_k)[log(p(z))]
         expectation_prior = 0.
         for k in range(self.K):
-            expectation_prior += -self.pis[k] * (self.sigmas[k] ** 2 + self.mus[k] ** 2 + 0.79817986835) #log(2pie)
+            expectation_prior += -self.pis[k] * 0.5 * (self.sigmas[k] ** 2 + self.mus[k] ** 2 +1.837877) #log(2pie) 0.79817986835
 
         # final objective
-        elbo = tf.reduce_mean(nll + ent_lb_term - self.regularization_weight * ent_mix_weights)
+        elbo = tf.reduce_mean(nll + expectation_prior + ent_lb_term - self.regularization_weight * ent_mix_weights)
 
         return elbo
 
@@ -183,6 +183,7 @@ class ACIN_VAE(object):
     def get_samples(self, nImages):
         samples_from_each_component = []
         for k in xrange(self.K):
+            #prior':{'mu':0., 'sigma':1.}
             z = 0. + tf.multiply(1.,tf.random_normal((nImages, tf.shape(self.decoder_params['w'][0])[0])))
             samples_from_each_component.append(tf.sigmoid(mlp(z, self.decoder_params)))
         return samples_from_each_component
