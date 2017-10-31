@@ -10,9 +10,9 @@ except ImportError:
 
 # command line arguments
 flags = tf.flags
-flags.DEFINE_integer("batchSize", 128, "batch size.")
+flags.DEFINE_integer("batchSize", 100, "batch size.")
 flags.DEFINE_integer("nEpochs", 2, "number of epochs to train.")
-flags.DEFINE_float("adamLr", 1e-4, "AdaM learning rate.")
+flags.DEFINE_float("adamLr", 3e-4, "AdaM learning rate.")
 flags.DEFINE_integer("hidden_size", 200, "number of hidden units in en/decoder.")
 flags.DEFINE_integer("latent_size", 50, "dimensionality of latent variables.")
 flags.DEFINE_integer("K", 5, "Maximun number of loops in RNN.")
@@ -40,7 +40,7 @@ def log_normal_pdf(x, mu, sigma):
     d = mu - x
     d2 = tf.multiply(-1., tf.multiply(d,d))
     s2 = tf.multiply(2., tf.multiply(sigma,sigma))
-    return tf.reduce_sum(tf.div(d2,s2) - tf.log(tf.multiply(sigma, 2.506628)))
+    return tf.reduce_sum(tf.div(d2,s2) - tf.log(tf.multiply(sigma, 2.506628)), reduction_indices=1, keep_dims=True)
 
 #Adaptive Computation Inference Network
 class ACIN_VAE(object):
@@ -113,7 +113,9 @@ class ACIN_VAE(object):
             # compute component weights
             gamma = tf.nn.sigmoid(tf.matmul(hidden_states[idx], self.encoder_params['pi']['W']) + self.encoder_params['pi']['b'])
 
-            length_check = tf.reduce_max((1. - gamma) * remaining_stick)
+            length_check = tf.reduce_max((1. - gamma) * remaining_stick)  #we have batchsize * 1 length , if maximum of remainning stick is less than eps
+            # we should stop,then
+
             gamma = tf.cond(length_check < stick_eps, lambda: 0. * gamma + 1., lambda: gamma)
 
             self.pis.append(gamma * remaining_stick)
@@ -155,30 +157,52 @@ class ACIN_VAE(object):
         #Expectation of Prior  \sum_k \pi_k E(q_k)[log(p(z))]
         expectation_prior = 0.
         for k in range(self.K):
-            expectation_prior += -self.pis[k] * 0.5 * (self.sigmas[k] ** 2 + self.mus[k] ** 2 +1.837877) #log(2pie) 0.79817986835
+            expectation_prior += -self.pis[k] * 0.5 * (self.sigmas[k] ** 2 + self.mus[k] ** 2 + 1.837877) #log(2pie) 0.79817986835
 
         # final objective
         elbo = tf.reduce_mean(nll + expectation_prior + ent_lb_term - self.regularization_weight * ent_mix_weights)
 
         return elbo
 
-    def get_log_margLL(self):
+    def get_log_margLL(self,batchSize):
 
-        nll = 0
-        for k in range(self.K):
-            nll -= self.pis[k] * compute_nll(self.X, self.x_recons_linear[k])
+        # sample a component index
+        uni_samples = tf.random_uniform((tf.shape(self.mus[0])[0], self.K), minval=1e-8, maxval=1-1e-8)
+        gumbel_samples = -tf.log(-tf.log(uni_samples))
+        component_samples = tf.to_int32(tf.argmax(tf.log(tf.concat(self.pis,1)) + gumbel_samples, 1))
+        component_samples = tf.concat([tf.expand_dims(tf.range(0,tf.shape(self.mus[0])[0]),1), tf.expand_dims(component_samples,1)],1)
+
+        # calc likelihood term for *all* components
+        all_ll = []
+        for k in xrange(self.K): all_ll.append(-compute_nll(self.X, self.x_recons_linear[k]))
+        all_ll = tf.concat(all_ll,1)
+
+        # pick out likelihood terms for sampled K
+        ll = tf.gather_nd(all_ll, component_samples)
+        ll = tf.expand_dims(ll,1)
 
         # calc prior prior':{'mu':0., 'sigma':1.}
-        log_prior = 0
+        all_log_priors = []
         for k in range(self.K):
-            log_prior += self.pis[k] * log_normal_pdf(self.z[k], 0., 1.)
+            all_log_priors.append( log_normal_pdf(self.z[k], 0., 1.) )
+        all_log_priors = tf.concat(all_log_priors,1)
 
-        # calc post
-        log_post = 0
-        for k in range(self.K):
-            log_post += self.pis[k] * log_normal_pdf(self.z[k], self.mus[k], self.sigmas[k])
+        # pick out prior terms for sampled K
+        log_prior = tf.gather_nd(all_log_priors, component_samples)
+        log_prior = tf.expand_dims(log_prior,1)
 
-        return nll + log_prior - log_post
+        # calculate all posterior probs
+        all_log_gauss_posts = []
+        for k in xrange(self.K):
+            all_log_gauss_posts.append(log_normal_pdf(self.z[k], self.mus[k], self.sigmas[k]))
+        all_log_gauss_posts = tf.concat(all_log_gauss_posts,1)
+
+        # pick out post terms for sampled K
+        log_gauss_post = tf.gather_nd(all_log_gauss_posts, component_samples)
+        log_gauss_post = tf.expand_dims(log_gauss_post,1)
+
+        return ll + log_prior - log_gauss_post
+
 
     def get_samples(self, nImages):
         samples_from_each_component = []
@@ -253,7 +277,7 @@ def trainVAE(data, vae_hyperParams, hyperParams):
         sample_collector = []
         nSamples = 50
         for s_idx in xrange(nSamples):
-            samples = s.run(model.get_log_margLL(), {model.X: mnist['test']})
+            samples = s.run(model.get_log_margLL(N), {model.X: mnist['test']})
             if not np.isnan(samples.mean()) and not np.isinf(samples.mean()):
                 sample_collector.append(samples)
 
